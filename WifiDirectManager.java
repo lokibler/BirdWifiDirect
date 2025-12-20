@@ -714,6 +714,23 @@ public class WifiDirectManager {
             heartbeatTask = null;
         }
 
+        // Remove Wi-Fi Direct group to fully disconnect
+        try {
+            manager.removeGroup(channel, new WifiP2pManager.ActionListener() {
+                @Override
+                public void onSuccess() {
+                    Log.d(TAG, "Wi-Fi Direct group removed");
+                }
+                
+                @Override
+                public void onFailure(int reason) {
+                    Log.w(TAG, "Failed to remove group (may not be in a group): " + reason);
+                }
+            });
+        } catch (Exception e) {
+            Log.w(TAG, "Error removing group", e);
+        }
+
         currentInfo = null;
         setState(ConnectionState.IDLE, null);
 

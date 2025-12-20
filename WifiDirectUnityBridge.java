@@ -10,6 +10,8 @@ public class WifiDirectUnityBridge {
 
     public static void Init() {
         WifiDirectManager mgr = getMgr();
+        // Disconnect any existing connection first to start fresh
+        mgr.disconnect();
         mgr.ensurePermissions();
         mgr.registerReceiver();
     }
