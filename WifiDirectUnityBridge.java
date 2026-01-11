@@ -20,6 +20,14 @@ public class WifiDirectUnityBridge {
         getMgr().setFrameId(frameId);
     }
 
+    public static void SetIsHost(boolean isHost) {
+        getMgr().setIsHost(isHost);
+    }
+
+    public static void SetMultipleHostsExist(boolean multiple) {
+        getMgr().setMultipleHostsExist(multiple);
+    }
+
     public static void disconnect() {
         getMgr().disconnect();
     }

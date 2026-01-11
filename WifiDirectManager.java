@@ -68,6 +68,8 @@ public class WifiDirectManager {
     
     // Device identity
     private volatile String frameId = null; // e.g., "FRAME_A", "FRAME_B"
+    private volatile boolean isHost = false; // Whether this device acts as a host
+    private volatile boolean multipleHostsExist = false; // Whether multiple hosts exist in the network
     
     // Network binding
     private volatile Network boundP2pNetwork = null;
@@ -94,7 +96,11 @@ public class WifiDirectManager {
         return t;
     });
     
-    private volatile SocketConnection activeConnection = null;
+    // Socket connections
+    // For hosts: Map of client frame ID -> SocketConnection (supports up to 4 clients)
+    // For clients: Single connection to host (stored with key "HOST")
+    private final Map<String, SocketConnection> activeConnections = new ConcurrentHashMap<>();
+    private final int MAX_CLIENTS = 4; // Maximum clients per host
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
 
     public static WifiDirectManager getInstance(Activity activity) {
@@ -127,12 +133,27 @@ public class WifiDirectManager {
 
     /**
      * Set the frame ID for this device (e.g., "FRAME_A", "FRAME_B")
-     * Used for lexicographic role determination.
      * Note: The Wi-Fi Direct device name must be manually set to "BIRD_FRAME_X" on the tablet.
      */
     public void setFrameId(String frameId) {
         this.frameId = frameId;
         Log.d(TAG, "Frame ID set to: " + frameId + " (device name should be BIRD_FRAME_" + frameId + ")");
+    }
+
+    /**
+     * Set whether this device should act as a host (accepts multiple client connections)
+     */
+    public void setIsHost(boolean isHost) {
+        this.isHost = isHost;
+        Log.d(TAG, "Host role set to: " + isHost);
+    }
+
+    /**
+     * Set whether multiple hosts exist in the network (affects reconnection logic)
+     */
+    public void setMultipleHostsExist(boolean multiple) {
+        this.multipleHostsExist = multiple;
+        Log.d(TAG, "Multiple hosts exist: " + multiple);
     }
 
     private void setState(ConnectionState newState, String details) {
@@ -264,6 +285,12 @@ public class WifiDirectManager {
     public void connectFirstPeer() {
         if (shutdown.get()) return;
         
+        // Hosts don't initiate connections - they wait for clients to connect
+        if (isHost) {
+            Log.d(TAG, "Host device - skipping connectFirstPeer, waiting for clients to connect");
+            return;
+        }
+        
         if (frameId == null) {
             setState(ConnectionState.ERROR, "CONNECT_NO_FRAME_ID");
             Log.w(TAG, "Cannot connect - frameId not set. Call setFrameId() first.");
@@ -299,9 +326,8 @@ public class WifiDirectManager {
                 }
                 Log.d(TAG, "All discovered peers: " + allPeers);
 
-                // Find matching BIRD_FRAME device and determine role
+                // Find matching BIRD_FRAME device (client connects to any available peer)
                 WifiP2pDevice target = null;
-                String peerFrameId = null;
                 
                 for (WifiP2pDevice d : peers.getDeviceList()) {
                     Log.d(TAG, "Checking device: " + d.deviceName + " (looking for BIRD_FRAME_ prefix)");
@@ -310,7 +336,6 @@ public class WifiDirectManager {
                         Log.d(TAG, "Found BIRD_FRAME device: " + d.deviceName + ", extracted frameId: " + extractedFrameId);
                         if (extractedFrameId != null && !extractedFrameId.equals(frameId)) {
                             target = d;
-                            peerFrameId = extractedFrameId;
                             break;
                         } else {
                             Log.d(TAG, "Skipping device - same frameId as ours (" + frameId + ")");
@@ -324,17 +349,9 @@ public class WifiDirectManager {
                     return;
                 }
 
-                // Determine if we should initiate based on lexicographic comparison
-                boolean shouldInitiate = shouldInitiateConnection(frameId, peerFrameId);
-                
-                if (shouldInitiate) {
-                    Log.d(TAG, "Initiating connection to " + target.deviceName + " (we become GO)");
-                    connect(target);
-                } else {
-                    Log.d(TAG, "Waiting for " + target.deviceName + " to initiate (they become GO)");
-                    // Don't call connect() - wait for them to connect to us
-                    setState(ConnectionState.IDLE, "WAITING_FOR_PEER_INITIATE");
-                }
+                // Client always initiates connection
+                Log.d(TAG, "Client initiating connection to " + target.deviceName);
+                connect(target);
             });
         } catch (SecurityException se) {
             setState(ConnectionState.ERROR, "REQUEST_PEERS_SECURITY_EXCEPTION");
@@ -479,10 +496,15 @@ public class WifiDirectManager {
         // Bind to P2P network first, then start sockets
         bindToP2pNetwork(() -> {
             if (info.isGroupOwner) {
-                setState(ConnectionState.CONNECTED, "ROLE=GO:PORT=8988");
-                startServer();
+                // Only start server if we're configured as a host
+                if (isHost) {
+                    startServer();
+                } else {
+                    Log.w(TAG, "Became GO but not configured as host - this shouldn't happen with explicit host/client roles");
+                    setState(ConnectionState.ERROR, "ROLE_MISMATCH:GO_but_not_host");
+                }
             } else {
-                setState(ConnectionState.CONNECTED, "ROLE=CLIENT:GO=" + info.groupOwnerAddress);
+                // Client connects to host
                 startClient(info.groupOwnerAddress);
             }
         });
@@ -556,43 +578,72 @@ public class WifiDirectManager {
 
     // ---------------- SOCKET MANAGEMENT ----------------
 
+    private ServerSocket serverSocket = null;
+    private final Set<String> connectedFrameIds = ConcurrentHashMap.newKeySet(); // Track connected client frame IDs
+
     private void startServer() {
-        if (activeConnection != null) {
-            activeConnection.close();
+        // Close any existing connections
+        synchronized (activeConnections) {
+            for (SocketConnection conn : activeConnections.values()) {
+                if (conn != null) {
+                    conn.close();
+                }
+            }
+            activeConnections.clear();
+            connectedFrameIds.clear();
         }
 
         CompletableFuture.runAsync(() -> {
             ServerSocket ss = null;
-            Socket s = null;
-            BufferedReader in = null;
-            PrintWriter out;
 
             try {
                 ss = new ServerSocket();
                 ss.setReuseAddress(true);
                 ss.bind(new InetSocketAddress(8988));
+                serverSocket = ss;
                 Log.d(TAG, "Server listening on port 8988");
 
-                s = ss.accept();
-                Log.d(TAG, "Server accepted connection from " + s.getInetAddress());
-
-                out = new PrintWriter(new BufferedWriter(new OutputStreamWriter(s.getOutputStream())), true);
-                in = new BufferedReader(new InputStreamReader(s.getInputStream()));
-
-                activeConnection = new SocketConnection(s, in, out);
-                setState(ConnectionState.CONNECTED, "SOCKET_CONNECTED");
-
-                // Start heartbeat
-                startHeartbeat(out);
-
-                String line;
-                while (!shutdown.get() && (line = in.readLine()) != null) {
-                    if (stateListener != null) {
-                        stateListener.onMessageReceived(line);
+                // Update state once server is listening
+                synchronized (activeConnections) {
+                    if (activeConnections.isEmpty()) {
+                        setState(ConnectionState.CONNECTED, "ROLE=HOST:CONNECTED=0/" + MAX_CLIENTS + ":PORT=8988");
                     }
                 }
 
-                Log.d(TAG, "Server connection closed");
+                // Accept multiple client connections (up to MAX_CLIENTS)
+                while (!shutdown.get() && ss != null) {
+                    try {
+                        Socket clientSocket = ss.accept();
+                        if (clientSocket == null) continue;
+
+                        synchronized (activeConnections) {
+                            if (activeConnections.size() >= MAX_CLIENTS) {
+                                Log.w(TAG, "Max clients reached (" + MAX_CLIENTS + "), rejecting connection from " + clientSocket.getInetAddress());
+                                try {
+                                    clientSocket.close();
+                                } catch (Exception ignored) {}
+                                continue;
+                            }
+                        }
+
+                        Log.d(TAG, "Server accepted connection from " + clientSocket.getInetAddress());
+                        
+                        // Handle each client connection in a separate thread
+                        handleClientConnection(clientSocket);
+                    } catch (java.net.SocketException e) {
+                        // Socket closed or connection reset - expected when shutting down
+                        if (!shutdown.get()) {
+                            Log.d(TAG, "Server socket closed or connection reset");
+                        }
+                        break;
+                    } catch (Exception e) {
+                        if (!shutdown.get()) {
+                            Log.e(TAG, "Error accepting client connection", e);
+                        }
+                    }
+                }
+
+                Log.d(TAG, "Server stopped accepting connections");
             } catch (Exception e) {
                 if (!shutdown.get()) {
                     Log.e(TAG, "Server error", e);
@@ -600,17 +651,131 @@ public class WifiDirectManager {
                     handleDisconnection();
                 }
             } finally {
-                if (in != null) try { in.close(); } catch (Exception ignored) {}
-                if (s != null) try { s.close(); } catch (Exception ignored) {}
-                if (ss != null) try { ss.close(); } catch (Exception ignored) {}
-                activeConnection = null;
+                if (ss != null) {
+                    try {
+                        ss.close();
+                    } catch (Exception ignored) {}
+                }
+                serverSocket = null;
             }
         }, socketExecutor);
     }
 
+    private void handleClientConnection(Socket clientSocket) {
+        CompletableFuture.runAsync(() -> {
+            BufferedReader in = null;
+            PrintWriter out = null;
+            String connectionKey = null; // Will be set to frame ID once we receive a message
+
+            try {
+                out = new PrintWriter(new BufferedWriter(new OutputStreamWriter(clientSocket.getOutputStream())), true);
+                in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
+
+                // Use IP address as temporary key until we get frame ID from messages
+                connectionKey = clientSocket.getInetAddress().toString();
+                
+                SocketConnection conn = new SocketConnection(clientSocket, in, out);
+                synchronized (activeConnections) {
+                    activeConnections.put(connectionKey, conn);
+                }
+
+                Log.d(TAG, "Client connection handler started for " + connectionKey);
+                
+                // Update connection state
+                updateConnectionState();
+
+                String line;
+                while (!shutdown.get() && (line = in.readLine()) != null) {
+                    // Extract frame ID from message if present
+                    // Message format: {targetFrameId}:{messageType}:{sourceFrameId}:{data}
+                    String sourceFrameId = extractSourceFrameId(line);
+                    if (sourceFrameId != null && !connectionKey.equals(sourceFrameId)) {
+                        // Update mapping from IP to frame ID
+                        synchronized (activeConnections) {
+                            if (activeConnections.containsKey(connectionKey)) {
+                                SocketConnection oldConn = activeConnections.remove(connectionKey);
+                                activeConnections.put(sourceFrameId, oldConn);
+                                connectionKey = sourceFrameId;
+                                connectedFrameIds.add(sourceFrameId);
+                            }
+                        }
+                        updateConnectionState();
+                    }
+
+                    // Route message to Unity
+                    if (stateListener != null) {
+                        stateListener.onMessageReceived(line);
+                    }
+                }
+
+                Log.d(TAG, "Client connection closed: " + connectionKey);
+            } catch (Exception e) {
+                if (!shutdown.get()) {
+                    Log.e(TAG, "Client connection error for " + connectionKey, e);
+                }
+            } finally {
+                synchronized (activeConnections) {
+                    if (connectionKey != null) {
+                        activeConnections.remove(connectionKey);
+                        if (connectionKey.startsWith("BIRD_FRAME_") || !connectionKey.contains(".")) {
+                            // It's a frame ID, not an IP
+                            connectedFrameIds.remove(connectionKey);
+                        } else {
+                            // It's an IP, need to find and remove associated frame ID
+                            connectedFrameIds.removeIf(id -> {
+                                // Check if this IP connection might have been mapped to a frame ID
+                                // This is approximate - ideally we'd track the mapping
+                                return false; // Keep all frame IDs for now
+                            });
+                        }
+                    }
+                }
+                
+                if (in != null) try { in.close(); } catch (Exception ignored) {}
+                if (clientSocket != null) try { clientSocket.close(); } catch (Exception ignored) {}
+                
+                updateConnectionState();
+            }
+        }, socketExecutor);
+    }
+
+    private String extractSourceFrameId(String message) {
+        // Message format: {targetFrameId}:{messageType}:{sourceFrameId}:{data}
+        if (message == null) return null;
+        String[] parts = message.split(":", 4);
+        if (parts.length >= 3) {
+            String sourceFrameId = parts[2];
+            // Validate it looks like a frame ID (starts with BIRD_FRAME_ or is a simple frame ID)
+            if (sourceFrameId.startsWith("BIRD_FRAME_")) {
+                return sourceFrameId.substring("BIRD_FRAME_".length());
+            } else if (!sourceFrameId.contains(".") && !sourceFrameId.isEmpty()) {
+                // Simple frame ID like "FRAME_A"
+                return sourceFrameId;
+            }
+        }
+        return null;
+    }
+
+    private void updateConnectionState() {
+        synchronized (activeConnections) {
+            int clientCount = activeConnections.size();
+            StringBuilder peerList = new StringBuilder();
+            for (String frameId : connectedFrameIds) {
+                if (peerList.length() > 0) peerList.append(",");
+                peerList.append("BIRD_FRAME_").append(frameId);
+            }
+            String peersStr = peerList.length() > 0 ? peerList.toString() : "none";
+            setState(ConnectionState.CONNECTED, "ROLE=HOST:CONNECTED=" + clientCount + "/" + MAX_CLIENTS + ":PEERS=" + peersStr);
+        }
+    }
+
     private void startClient(InetAddress host) {
-        if (activeConnection != null) {
-            activeConnection.close();
+        // Close any existing connection
+        synchronized (activeConnections) {
+            SocketConnection oldConn = activeConnections.remove("HOST");
+            if (oldConn != null) {
+                oldConn.close();
+            }
         }
 
         CompletableFuture.runAsync(() -> {
@@ -639,8 +804,14 @@ public class WifiDirectManager {
                 out = new PrintWriter(new BufferedWriter(new OutputStreamWriter(s.getOutputStream())), true);
                 in = new BufferedReader(new InputStreamReader(s.getInputStream()));
 
-                activeConnection = new SocketConnection(s, in, out);
-                setState(ConnectionState.CONNECTED, "SOCKET_CONNECTED");
+                SocketConnection conn = new SocketConnection(s, in, out);
+                synchronized (activeConnections) {
+                    activeConnections.put("HOST", conn);
+                }
+                
+                // Extract host frame ID from connection info if available
+                String hostFrameId = extractHostFrameId();
+                setState(ConnectionState.CONNECTED, "ROLE=CLIENT:HOST=" + (hostFrameId != null ? hostFrameId : host.toString()) + ":SOCKET_CONNECTED");
 
                 // Start heartbeat
                 startHeartbeat(out);
@@ -662,9 +833,17 @@ public class WifiDirectManager {
             } finally {
                 if (in != null) try { in.close(); } catch (Exception ignored) {}
                 if (s != null) try { s.close(); } catch (Exception ignored) {}
-                activeConnection = null;
+                synchronized (activeConnections) {
+                    activeConnections.remove("HOST");
+                }
             }
         }, socketExecutor);
+    }
+
+    private String extractHostFrameId() {
+        // Try to extract host frame ID from connection info
+        // This is approximate - we might not know the host's frame ID until we see messages
+        return null;
     }
 
     private ScheduledFuture<?> heartbeatTask = null;
@@ -689,24 +868,117 @@ public class WifiDirectManager {
     }
 
     public void sendMessage(String msg) {
-        if (activeConnection != null && activeConnection.out != null) {
-            try {
-                activeConnection.out.println(msg);
-                activeConnection.out.flush();
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to send message", e);
-                handleDisconnection();
+        if (isHost) {
+            // Host routes messages to specific clients based on target frame ID
+            // Message format: {targetFrameId}:{messageType}:{sourceFrameId}:{data}
+            // If no target (e.g., HEARTBEAT), broadcast to all clients
+            String targetFrameId = extractTargetFrameId(msg);
+            
+            synchronized (activeConnections) {
+                if (targetFrameId != null) {
+                    // Route to specific client
+                    SocketConnection targetConn = activeConnections.get(targetFrameId);
+                    if (targetConn != null && targetConn.out != null) {
+                        try {
+                            targetConn.out.println(msg);
+                            targetConn.out.flush();
+                        } catch (Exception e) {
+                            Log.e(TAG, "Failed to send message to " + targetFrameId, e);
+                            // Remove failed connection
+                            activeConnections.remove(targetFrameId);
+                            connectedFrameIds.remove(targetFrameId);
+                            updateConnectionState();
+                        }
+                    } else {
+                        Log.w(TAG, "No connection found for target frame ID: " + targetFrameId);
+                    }
+                } else {
+                    // Broadcast to all clients (e.g., HEARTBEAT)
+                    List<String> toRemove = new ArrayList<>();
+                    for (Map.Entry<String, SocketConnection> entry : activeConnections.entrySet()) {
+                        SocketConnection conn = entry.getValue();
+                        if (conn != null && conn.out != null) {
+                            try {
+                                conn.out.println(msg);
+                                conn.out.flush();
+                            } catch (Exception e) {
+                                Log.e(TAG, "Failed to broadcast message to " + entry.getKey(), e);
+                                toRemove.add(entry.getKey());
+                            }
+                        }
+                    }
+                    // Remove failed connections
+                    for (String key : toRemove) {
+                        activeConnections.remove(key);
+                        if (connectedFrameIds.contains(key)) {
+                            connectedFrameIds.remove(key);
+                        }
+                    }
+                    if (!toRemove.isEmpty()) {
+                        updateConnectionState();
+                    }
+                }
             }
         } else {
-            Log.w(TAG, "Cannot send message - no active connection");
+            // Client sends message to host
+            synchronized (activeConnections) {
+                SocketConnection hostConn = activeConnections.get("HOST");
+                if (hostConn != null && hostConn.out != null) {
+                    try {
+                        hostConn.out.println(msg);
+                        hostConn.out.flush();
+                    } catch (Exception e) {
+                        Log.e(TAG, "Failed to send message to host", e);
+                        handleDisconnection();
+                    }
+                } else {
+                    Log.w(TAG, "Cannot send message - no connection to host");
+                }
+            }
         }
+    }
+
+    private String extractTargetFrameId(String msg) {
+        // Message format: {targetFrameId}:{messageType}:{sourceFrameId}:{data}
+        if (msg == null) return null;
+        String[] parts = msg.split(":", 4);
+        if (parts.length >= 1 && !parts[0].isEmpty()) {
+            String targetFrameId = parts[0];
+            // Handle special messages (HEARTBEAT, etc.)
+            if ("HEARTBEAT".equals(targetFrameId)) {
+                return null; // Broadcast
+            }
+            // Validate it looks like a frame ID
+            if (targetFrameId.startsWith("BIRD_FRAME_")) {
+                return targetFrameId.substring("BIRD_FRAME_".length());
+            } else if (!targetFrameId.contains(".") && !targetFrameId.isEmpty()) {
+                // Simple frame ID like "FRAME_A"
+                return targetFrameId;
+            }
+        }
+        return null;
     }
 
     private void handleDisconnection() {
         Log.d(TAG, "Handling disconnection");
-        if (activeConnection != null) {
-            activeConnection.close();
-            activeConnection = null;
+        
+        // Close server socket if host
+        if (serverSocket != null) {
+            try {
+                serverSocket.close();
+            } catch (Exception ignored) {}
+            serverSocket = null;
+        }
+        
+        // Close all connections
+        synchronized (activeConnections) {
+            for (SocketConnection conn : activeConnections.values()) {
+                if (conn != null) {
+                    conn.close();
+                }
+            }
+            activeConnections.clear();
+            connectedFrameIds.clear();
         }
         
         if (heartbeatTask != null) {
