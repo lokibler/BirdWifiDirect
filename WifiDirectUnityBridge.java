@@ -28,6 +28,10 @@ public class WifiDirectUnityBridge {
         getMgr().setMultipleHostsExist(multiple);
     }
 
+    public static void SetLastConnectedHostFrameId(String hostFrameId) {
+        getMgr().setLastConnectedHostFrameId(hostFrameId);
+    }
+
     public static void disconnect() {
         getMgr().disconnect();
     }
@@ -38,6 +42,10 @@ public class WifiDirectUnityBridge {
 
     public static void ConnectFirstPeer() {
         getMgr().connectFirstPeer();
+    }
+
+    public static void CreateGroup() {
+        getMgr().createGroup();
     }
 
     public static void SendMessage(String msg) {

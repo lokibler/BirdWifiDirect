@@ -70,6 +70,7 @@ public class WifiDirectManager {
     private volatile String frameId = null; // e.g., "FRAME_A", "FRAME_B"
     private volatile boolean isHost = false; // Whether this device acts as a host
     private volatile boolean multipleHostsExist = false; // Whether multiple hosts exist in the network
+    private volatile String lastConnectedHostFrameId = null; // Last host frame ID we connected to (for filtering reconnections)
     
     // Network binding
     private volatile Network boundP2pNetwork = null;
@@ -102,6 +103,7 @@ public class WifiDirectManager {
     private final Map<String, SocketConnection> activeConnections = new ConcurrentHashMap<>();
     private final int MAX_CLIENTS = 4; // Maximum clients per host
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
+    private final AtomicBoolean disconnecting = new AtomicBoolean(false); // Prevent concurrent disconnections
 
     public static WifiDirectManager getInstance(Activity activity) {
         if (instance == null) {
@@ -154,6 +156,11 @@ public class WifiDirectManager {
     public void setMultipleHostsExist(boolean multiple) {
         this.multipleHostsExist = multiple;
         Log.d(TAG, "Multiple hosts exist: " + multiple);
+    }
+
+    public void setLastConnectedHostFrameId(String hostFrameId) {
+        this.lastConnectedHostFrameId = hostFrameId;
+        Log.d(TAG, "Last Connected Host Frame ID set to: " + hostFrameId);
     }
 
     private void setState(ConnectionState newState, String details) {
@@ -210,24 +217,9 @@ public class WifiDirectManager {
     }
 
     // ---------------- ROLE SELECTION ----------------
-
-    /**
-     * Determines if this device should initiate connection based on lexicographic comparison
-     * Higher-named device (e.g., "FRAME_B") becomes Group Owner (server)
-     * Lower-named device (e.g., "FRAME_A") connects as client
-     * 
-     * @param myFrameId This device's frame ID
-     * @param peerFrameId Peer device's frame ID (extracted from device name)
-     * @return true if this device should initiate (becomes GO), false to wait for connection
-     */
-    private boolean shouldInitiateConnection(String myFrameId, String peerFrameId) {
-        if (myFrameId == null || peerFrameId == null) {
-            return false; // Can't determine, don't initiate
-        }
-        // Lexicographic comparison: higher name becomes Group Owner
-        // e.g., "FRAME_B" > "FRAME_A", so B initiates and becomes GO
-        return myFrameId.compareTo(peerFrameId) > 0;
-    }
+    // Note: Roles are fixed - hosts (isHost=true) become GO via createGroup(),
+    // clients (isHost=false) connect with groupOwnerIntent=0 to prefer client role.
+    // No lexicographic comparison needed - roles are determined by isHost flag.
 
     /**
      * Extract frame ID from device name (assumes format "BIRD_FRAME_X")
@@ -327,6 +319,7 @@ public class WifiDirectManager {
                 Log.d(TAG, "All discovered peers: " + allPeers);
 
                 // Find matching BIRD_FRAME device (client connects to any available peer)
+                // If multipleHostsExist is true, skip the last connected host
                 WifiP2pDevice target = null;
                 
                 for (WifiP2pDevice d : peers.getDeviceList()) {
@@ -334,11 +327,24 @@ public class WifiDirectManager {
                     if (d.deviceName != null && d.deviceName.startsWith("BIRD_FRAME_")) {
                         String extractedFrameId = extractFrameIdFromDeviceName(d.deviceName);
                         Log.d(TAG, "Found BIRD_FRAME device: " + d.deviceName + ", extracted frameId: " + extractedFrameId);
-                        if (extractedFrameId != null && !extractedFrameId.equals(frameId)) {
+                        
+                        // Skip if same as our frame ID
+                        if (extractedFrameId != null && extractedFrameId.equals(frameId)) {
+                            Log.d(TAG, "Skipping device - same frameId as ours (" + frameId + ")");
+                            continue;
+                        }
+                        
+                        // If multiple hosts exist, skip the last connected host
+                        if (multipleHostsExist && lastConnectedHostFrameId != null && 
+                            extractedFrameId != null && extractedFrameId.equals(lastConnectedHostFrameId)) {
+                            Log.d(TAG, "Skipping device - last connected host (" + lastConnectedHostFrameId + ") and multiple hosts exist");
+                            continue;
+                        }
+                        
+                        // Found a valid target
+                        if (extractedFrameId != null) {
                             target = d;
                             break;
-                        } else {
-                            Log.d(TAG, "Skipping device - same frameId as ours (" + frameId + ")");
                         }
                     }
                 }
@@ -362,6 +368,7 @@ public class WifiDirectManager {
         WifiP2pConfig cfg = new WifiP2pConfig();
         cfg.deviceAddress = device.deviceAddress;
         cfg.wps.setup = WpsInfo.PBC;
+        cfg.groupOwnerIntent = 0; // Clients prefer client role, not GO (roles are fixed)
 
         setState(ConnectionState.CONNECTING, "CONNECTING_TO:" + device.deviceName);
 
@@ -385,6 +392,53 @@ public class WifiDirectManager {
             });
         } catch (SecurityException se) {
             setState(ConnectionState.ERROR, "CONNECT_SECURITY_EXCEPTION");
+        }
+    }
+
+    public void createGroup() {
+        if (shutdown.get()) return;
+        if (!isHost) {
+            Log.d(TAG, "Not a host - skipping createGroup");
+            return;
+        }
+        
+        ensurePermissions();
+        if (!hasP2pPermissions()) {
+            setState(ConnectionState.ERROR, "CREATE_GROUP_SKIP:NO_PERMS");
+            return;
+        }
+        
+        ConnectionState current = getState();
+        if (current == ConnectionState.CONNECTED || current == ConnectionState.CONNECTING) {
+            Log.d(TAG, "Skipping createGroup - already connected or connecting");
+            return;
+        }
+        
+        Log.d(TAG, "Host creating Wi-Fi Direct group to become GO");
+        setState(ConnectionState.CONNECTING, "CREATING_GROUP");
+        
+        try {
+            manager.createGroup(channel, new WifiP2pManager.ActionListener() {
+                @Override
+                public void onSuccess() {
+                    Log.d(TAG, "Group created successfully - host is now GO");
+                    // Group creation triggers connection info callback via receiver
+                }
+                
+                @Override
+                public void onFailure(int reason) {
+                    Log.w(TAG, "Failed to create group, reason: " + reason);
+                    setState(ConnectionState.ERROR, "CREATE_GROUP_FAIL:" + reason);
+                    // Retry after delay
+                    scheduler.schedule(() -> {
+                        if (getState() != ConnectionState.CONNECTED && !shutdown.get()) {
+                            createGroup();
+                        }
+                    }, 5, TimeUnit.SECONDS);
+                }
+            });
+        } catch (SecurityException se) {
+            setState(ConnectionState.ERROR, "CREATE_GROUP_SECURITY_EXCEPTION");
         }
     }
 
@@ -609,6 +663,9 @@ public class WifiDirectManager {
                         setState(ConnectionState.CONNECTED, "ROLE=HOST:CONNECTED=0/" + MAX_CLIENTS + ":PORT=8988");
                     }
                 }
+                
+                // Start heartbeat for hosts (broadcasts to all clients)
+                startHostHeartbeat();
 
                 // Accept multiple client connections (up to MAX_CLIENTS)
                 while (!shutdown.get() && ss != null) {
@@ -686,6 +743,25 @@ public class WifiDirectManager {
 
                 String line;
                 while (!shutdown.get() && (line = in.readLine()) != null) {
+                    // Check for HANDSHAKE message first (format: :HANDSHAKE:{frameId}:)
+                    if (line.startsWith(":HANDSHAKE:") && line.endsWith(":")) {
+                        String handshakeFrameId = line.substring(11, line.length() - 1); // Extract frame ID between :HANDSHAKE: and :
+                        if (!handshakeFrameId.isEmpty()) {
+                            synchronized (activeConnections) {
+                                if (activeConnections.containsKey(connectionKey)) {
+                                    SocketConnection oldConn = activeConnections.remove(connectionKey);
+                                    activeConnections.put(handshakeFrameId, oldConn);
+                                    connectionKey = handshakeFrameId;
+                                    connectedFrameIds.add(handshakeFrameId);
+                                    Log.d(TAG, "Host identified client as: " + handshakeFrameId + " (was " + connectionKey + ")");
+                                    updateConnectionState();
+                                }
+                            }
+                            // Don't route HANDSHAKE to Unity - it's an internal protocol message
+                            continue;
+                        }
+                    }
+                    
                     // Extract frame ID from message if present
                     // Message format: {targetFrameId}:{messageType}:{sourceFrameId}:{data}
                     String sourceFrameId = extractSourceFrameId(line);
@@ -813,6 +889,15 @@ public class WifiDirectManager {
                 String hostFrameId = extractHostFrameId();
                 setState(ConnectionState.CONNECTED, "ROLE=CLIENT:HOST=" + (hostFrameId != null ? hostFrameId : host.toString()) + ":SOCKET_CONNECTED");
 
+                // Send frame ID immediately so host can identify this client
+                // Format: :HANDSHAKE:{sourceFrameId}:
+                if (frameId != null && !frameId.isEmpty()) {
+                    String handshakeMsg = ":HANDSHAKE:" + frameId + ":";
+                    out.println(handshakeMsg);
+                    out.flush();
+                    Log.d(TAG, "Client sent handshake with frame ID: " + frameId);
+                }
+
                 // Start heartbeat
                 startHeartbeat(out);
 
@@ -847,8 +932,10 @@ public class WifiDirectManager {
     }
 
     private ScheduledFuture<?> heartbeatTask = null;
+    private ScheduledFuture<?> hostHeartbeatTask = null;
 
     private void startHeartbeat(PrintWriter out) {
+        // For clients: send heartbeat to host
         if (heartbeatTask != null) {
             heartbeatTask.cancel(false);
         }
@@ -862,6 +949,29 @@ public class WifiDirectManager {
                 } catch (Exception e) {
                     Log.w(TAG, "Heartbeat failed", e);
                     handleDisconnection();
+                }
+            }
+        }, 30, 30, TimeUnit.SECONDS);
+    }
+
+    private void startHostHeartbeat() {
+        // For hosts: broadcast heartbeat to all clients
+        if (hostHeartbeatTask != null) {
+            hostHeartbeatTask.cancel(false);
+        }
+        // Use scheduleWithFixedDelay instead of scheduleAtFixedRate to avoid execution
+        // when Android processes become cached
+        hostHeartbeatTask = scheduler.scheduleWithFixedDelay(() -> {
+            if (!shutdown.get() && isHost) {
+                // Broadcast HEARTBEAT to all connected clients
+                synchronized (activeConnections) {
+                    int clientCount = activeConnections.size();
+                    if (clientCount > 0) {
+                        Log.d(TAG, "Host broadcasting HEARTBEAT to " + clientCount + " client(s)");
+                        sendMessage("HEARTBEAT");
+                    } else {
+                        Log.d(TAG, "Host heartbeat skipped - no clients connected");
+                    }
                 }
             }
         }, 30, 30, TimeUnit.SECONDS);
@@ -962,31 +1072,43 @@ public class WifiDirectManager {
     private void handleDisconnection() {
         Log.d(TAG, "Handling disconnection");
         
-        // Close server socket if host
+        // Close server socket if host (non-blocking)
         if (serverSocket != null) {
             try {
                 serverSocket.close();
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                Log.w(TAG, "Error closing server socket", e);
+            }
             serverSocket = null;
         }
         
-        // Close all connections
+        // Close all connections (non-blocking, but synchronized for thread safety)
         synchronized (activeConnections) {
             for (SocketConnection conn : activeConnections.values()) {
                 if (conn != null) {
-                    conn.close();
+                    try {
+                        conn.close();
+                    } catch (Exception e) {
+                        Log.w(TAG, "Error closing connection", e);
+                    }
                 }
             }
             activeConnections.clear();
             connectedFrameIds.clear();
         }
         
+        // Cancel heartbeat tasks (non-blocking)
         if (heartbeatTask != null) {
             heartbeatTask.cancel(false);
             heartbeatTask = null;
         }
+        
+        if (hostHeartbeatTask != null) {
+            hostHeartbeatTask.cancel(false);
+            hostHeartbeatTask = null;
+        }
 
-        // Remove Wi-Fi Direct group to fully disconnect
+        // Remove Wi-Fi Direct group (async, non-blocking)
         try {
             manager.removeGroup(channel, new WifiP2pManager.ActionListener() {
                 @Override
@@ -1004,26 +1126,45 @@ public class WifiDirectManager {
         }
 
         currentInfo = null;
-        setState(ConnectionState.IDLE, null);
+        // Don't set state here - let disconnect() set it after this completes
 
-        // Unbind network
+        // Unbind network (non-blocking, but may take time)
         try {
             connectivityManager.bindProcessToNetwork(null);
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            Log.w(TAG, "Error unbinding network", e);
+        }
         boundP2pNetwork = null;
 
-        // Unregister network callback
+        // Unregister network callback (non-blocking)
         if (p2pNetworkCallback != null) {
             try {
                 connectivityManager.unregisterNetworkCallback(p2pNetworkCallback);
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                Log.w(TAG, "Error unregistering network callback", e);
+            }
             p2pNetworkCallback = null;
         }
     }
 
     public void disconnect() {
-        handleDisconnection();
+        // Prevent concurrent disconnection attempts
+        if (!disconnecting.compareAndSet(false, true)) {
+            Log.d(TAG, "Disconnection already in progress, skipping");
+            return;
+        }
+        
+        // Set state immediately so Unity knows disconnect has started (before async cleanup)
         setState(ConnectionState.IDLE, "DISCONNECTED");
+        
+        // Run cleanup on background thread to avoid blocking Unity main thread
+        CompletableFuture.runAsync(() -> {
+            try {
+                handleDisconnection();
+            } finally {
+                disconnecting.set(false);
+            }
+        }, scheduler);
     }
 
     @SuppressWarnings("unused")
